@@ -306,15 +306,53 @@ cat > 'app/src/main/java/com/example/fireremote/RemoteKeyService.kt' <<'END_OF_F
 package com.example.fireremote
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.content.Context
 import android.content.Intent
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.PixelFormat
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.util.DisplayMetrics
+import android.view.Gravity
 import android.view.KeyEvent
+import android.view.View
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.widget.Toast
+import kotlin.math.min
 
 /**
- * Fire kumandasından gelen tuşları sistem genelinde yakalar (uygulama açık olmasa da).
- * Etkinleştirme: Ayarlar > Erişilebilirlik > Fire Kumanda Tuş İşleme.
+ * Fire kumandasından gelen tuşları sistem genelinde yakalar.
+ *
+ * NUMPAD_ENTER'a 2 kez hızlı basınca MOUSE MODU açılır/kapanır:
+ *  - Yön tuşları imleci hareket ettirir (basılı tutunca hızlanır)
+ *  - OK (tek basış) imlecin olduğu yere dokunur (tıklar)
+ *  - İleri sar / Geri sar: aşağı / yukarı kaydırır
+ *  - Geri tuşu mouse modundan çıkar
  */
 class RemoteKeyService : AccessibilityService() {
+
+    companion object {
+        private const val TRIGGER_KEY = KeyEvent.KEYCODE_NUMPAD_ENTER
+        private const val DOUBLE_PRESS_MS = 400L
+    }
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val wm by lazy { getSystemService(Context.WINDOW_SERVICE) as WindowManager }
+
+    private var mouseMode = false
+    private var cursorView: View? = null
+    private var cursorParams: WindowManager.LayoutParams? = null
+    private var cursorX = 0
+    private var cursorY = 0
+    private var lastTriggerPress = 0L
+    private var swallowTriggerUp = false
+    private val pendingClick = Runnable { tap() }
 
     override fun onServiceConnected() {
         KeyBus.serviceActive = true
@@ -325,30 +363,197 @@ class RemoteKeyService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         KeyBus.serviceActive = false
+        hideCursor()
+        mouseMode = false
         return super.onUnbind(intent)
     }
 
-    /** true dönersen tuş tüketilir (başka uygulamaya gitmez), false dönersen normal akar. */
     override fun onKeyEvent(event: KeyEvent): Boolean {
         val down = event.action == KeyEvent.ACTION_DOWN
         if (down && event.repeatCount == 0) KeyBus.emit(KeyBus.describe(event))
 
         if (!KeyBus.isFireRemote(event)) return false
+        if (event.keyCode == TRIGGER_KEY) return handleTrigger(event, down)
+        if (mouseMode) return handleMouseKey(event, down)
         return handleKey(event, down)
     }
 
-    // ---- Tuş eşlemeleri: kendi ihtiyacına göre değiştir ----
+    // ---------- NUMPAD_ENTER: 2 kez bas = mouse modu aç/kapat ----------
+
+    private fun handleTrigger(event: KeyEvent, down: Boolean): Boolean {
+        if (!down) {
+            val consume = swallowTriggerUp || mouseMode
+            swallowTriggerUp = false
+            return consume
+        }
+        if (event.repeatCount > 0) return mouseMode
+
+        val now = event.eventTime
+        if (now - lastTriggerPress <= DOUBLE_PRESS_MS) {
+            lastTriggerPress = 0L
+            handler.removeCallbacks(pendingClick)
+            swallowTriggerUp = true
+            setMouseMode(!mouseMode)
+            return true
+        }
+        lastTriggerPress = now
+
+        if (mouseMode) {
+            // Tek basış = tıkla (ikinci basış gelmezse)
+            handler.postDelayed(pendingClick, DOUBLE_PRESS_MS)
+            return true
+        }
+        return false // normal modda tek basış her zamanki gibi çalışır
+    }
+
+    // ---------- Mouse modu tuşları ----------
+
+    private fun handleMouseKey(event: KeyEvent, down: Boolean): Boolean {
+        val step = min(24 + event.repeatCount * 6, 140)
+        when (event.keyCode) {
+            KeyEvent.KEYCODE_DPAD_LEFT -> if (down) moveCursor(-step, 0)
+            KeyEvent.KEYCODE_DPAD_RIGHT -> if (down) moveCursor(step, 0)
+            KeyEvent.KEYCODE_DPAD_UP -> if (down) moveCursor(0, -step)
+            KeyEvent.KEYCODE_DPAD_DOWN -> if (down) moveCursor(0, step)
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER ->
+                if (down && event.repeatCount == 0) tap()
+            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD ->
+                if (down && event.repeatCount == 0) swipe(-500)
+            KeyEvent.KEYCODE_MEDIA_REWIND ->
+                if (down && event.repeatCount == 0) swipe(500)
+            KeyEvent.KEYCODE_BACK -> if (down) setMouseMode(false)
+            else -> return false
+        }
+        return true
+    }
+
+    // ---------- Normal mod tuş eşlemeleri ----------
+
     private fun handleKey(event: KeyEvent, down: Boolean): Boolean {
         val action = when (event.keyCode) {
             KeyEvent.KEYCODE_MENU -> GLOBAL_ACTION_RECENTS
             KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> GLOBAL_ACTION_NOTIFICATIONS
             KeyEvent.KEYCODE_MEDIA_REWIND -> GLOBAL_ACTION_QUICK_SETTINGS
-            // KeyEvent.KEYCODE_BACK -> GLOBAL_ACTION_BACK
-            // KeyEvent.KEYCODE_HOME -> GLOBAL_ACTION_HOME
-            else -> return false // yön tuşları, OK, oynat/duraklat vb. normal çalışsın
+            else -> return false
         }
         if (down && event.repeatCount == 0) performGlobalAction(action)
         return true
+    }
+
+    // ---------- İmleç ----------
+
+    private fun setMouseMode(on: Boolean) {
+        mouseMode = on
+        if (on) {
+            if (cursorX == 0 && cursorY == 0) {
+                val (w, h) = screenSize()
+                cursorX = w / 2
+                cursorY = h / 2
+            }
+            showCursor()
+        } else {
+            handler.removeCallbacks(pendingClick)
+            hideCursor()
+        }
+        Toast.makeText(this, if (on) "Mouse modu AÇIK" else "Mouse modu KAPALI", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun screenSize(): Pair<Int, Int> =
+        if (Build.VERSION.SDK_INT >= 30) {
+            val b = wm.currentWindowMetrics.bounds
+            b.width() to b.height()
+        } else {
+            val m = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(m)
+            m.widthPixels to m.heightPixels
+        }
+
+    private fun showCursor() {
+        if (cursorView != null) return
+        val d = resources.displayMetrics.density
+        val p = WindowManager.LayoutParams(
+            (24 * d).toInt(), (34 * d).toInt(),
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = cursorX
+            y = cursorY
+        }
+        val v = CursorView(this)
+        wm.addView(v, p)
+        cursorView = v
+        cursorParams = p
+    }
+
+    private fun hideCursor() {
+        cursorView?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        cursorView = null
+        cursorParams = null
+    }
+
+    private fun moveCursor(dx: Int, dy: Int) {
+        val (w, h) = screenSize()
+        cursorX = (cursorX + dx).coerceIn(0, w - 1)
+        cursorY = (cursorY + dy).coerceIn(0, h - 1)
+        val v = cursorView
+        val p = cursorParams
+        if (v != null && p != null) {
+            p.x = cursorX
+            p.y = cursorY
+            wm.updateViewLayout(v, p)
+        }
+    }
+
+    // ---------- Dokunma / kaydırma ----------
+
+    private fun tap() = gesture(cursorX, cursorY, cursorX, cursorY, 50L)
+
+    private fun swipe(dy: Int) {
+        val (_, h) = screenSize()
+        gesture(cursorX, cursorY, cursorX, (cursorY + dy).coerceIn(1, h - 1), 300L)
+    }
+
+    private fun gesture(x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Long) {
+        val path = Path().apply {
+            moveTo(x1.toFloat(), y1.toFloat())
+            if (x1 != x2 || y1 != y2) lineTo(x2.toFloat(), y2.toFloat())
+        }
+        val g = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, durationMs))
+            .build()
+        dispatchGesture(g, null, null)
+    }
+}
+
+/** Ekranda gösterilen ok şeklindeki imleç. Sol üst köşe = tıklama noktası. */
+private class CursorView(context: Context) : View(context) {
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE; style = Paint.Style.FILL
+    }
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.BLACK; style = Paint.Style.STROKE; strokeWidth = 3f
+    }
+    private val arrow = Path()
+
+    override fun onDraw(canvas: Canvas) {
+        val d = resources.displayMetrics.density
+        arrow.reset()
+        arrow.moveTo(1f, 1f)
+        arrow.lineTo(1f, 26 * d)
+        arrow.lineTo(7 * d, 20 * d)
+        arrow.lineTo(12 * d, 30 * d)
+        arrow.lineTo(16 * d, 28 * d)
+        arrow.lineTo(11 * d, 18 * d)
+        arrow.lineTo(19 * d, 18 * d)
+        arrow.close()
+        canvas.drawPath(arrow, fill)
+        canvas.drawPath(arrow, stroke)
     }
 }
 END_OF_FILE_XYZ
@@ -428,7 +633,7 @@ cat > 'app/src/main/res/values/strings.xml' <<'END_OF_FILE_XYZ'
 <resources>
     <string name="app_name">Fire Kumanda</string>
     <string name="service_label">Fire Kumanda Tuş İşleme</string>
-    <string name="service_desc">Amazon Fire kumandasının tuşlarını algılar ve cihazda eylemlere dönüştürür.</string>
+    <string name="service_desc">Fire kumandasının tuşlarını algılar; OK tuşuna 2 kez basınca mouse modu açılır ve ekrana dokunabilir.</string>
 </resources>
 END_OF_FILE_XYZ
 mkdir -p 'app/src/main/res/xml'
@@ -439,6 +644,7 @@ cat > 'app/src/main/res/xml/accessibility_service_config.xml' <<'END_OF_FILE_XYZ
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagRequestFilterKeyEvents"
     android:canRequestFilterKeyEvents="true"
+    android:canPerformGestures="true"
     android:description="@string/service_desc"
     android:notificationTimeout="100" />
 END_OF_FILE_XYZ
